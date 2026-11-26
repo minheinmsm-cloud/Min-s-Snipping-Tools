@@ -1,0 +1,1317 @@
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QRect, QRectF, QPointF, QTimer, Signal, QSize, QObject, QMimeData, QUrl
+from PySide6.QtGui import (QGuiApplication, QPixmap, QPainter, QColor, QPen,
+                           QPainterPath, QPolygonF, QPolygon, QKeySequence,
+                           QShortcut, QFont, QFontMetrics, QIcon, QImage)
+from PySide6.QtWidgets import (QApplication, QWidget, QMainWindow, QVBoxLayout,
+                               QHBoxLayout, QToolButton, QMenu, QScrollArea,
+                               QLabel, QFileDialog, QColorDialog, QComboBox,
+                               QButtonGroup, QFrame, QMessageBox, QLineEdit,
+                               QPushButton)
+
+try:
+    import cv2
+    import numpy as np
+    HAVE_CV = True
+except Exception:
+    HAVE_CV = False
+
+try:
+    import imageio_ffmpeg
+    HAVE_FFMPEG = True
+except Exception:
+    HAVE_FFMPEG = False
+
+STYLE = """
+QMainWindow, QWidget#root { background: #f3f3f3; font-family: 'Segoe UI'; }
+QToolButton { border: 1px solid transparent; border-radius: 5px;
+              padding: 6px 12px; font-size: 15px; background: transparent; }
+QToolButton:hover { background: #e5e5e5; }
+QToolButton:checked { background: #dbe9f7; border: 1px solid #2a76c6; }
+QToolButton:disabled { color: #aaa; }
+QToolButton::menu-indicator { width: 8px; }
+QComboBox { font-size: 14px; padding: 3px 8px; border: 1px solid #ccc; border-radius: 4px; background: white; }
+QFrame#sep { background: #d0d0d0; }
+QScrollArea { background: white; border: none; }
+"""
+
+
+# ---------------------------------------------------------------- capture
+def grab_all():
+    """Grab every monitor into one pixmap. Returns (pixmap, virtual_geometry)."""
+    screens = QGuiApplication.screens()
+    vgeo = screens[0].geometry()
+    for s in screens[1:]:
+        vgeo = vgeo.united(s.geometry())
+    sc = max(s.devicePixelRatio() for s in screens)
+    pm = QPixmap(round(vgeo.width() * sc), round(vgeo.height() * sc))
+    pm.fill(Qt.black)
+    p = QPainter(pm)
+    for s in screens:
+        g = s.geometry()
+        target = QRect(round((g.x() - vgeo.x()) * sc), round((g.y() - vgeo.y()) * sc),
+                       round(g.width() * sc), round(g.height() * sc))
+        p.drawPixmap(target, s.grabWindow(0))
+    p.end()
+    return pm, vgeo
+
+
+class SnipOverlay(QWidget):
+    done = Signal(object)  # QPixmap or None
+    region = Signal(object)  # QRect in screen coordinates (video mode)
+
+    def __init__(self, shot, vgeo, mode, video=False):
+        super().__init__()
+        self.shot, self.mode, self.video = shot, mode, video
+        self.start = self.end = None
+        self.points = []
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setCursor(Qt.CrossCursor)
+        self.setGeometry(vgeo)
+        self.show()
+        self.activateWindow()
+        self.setFocus()
+
+    def ratio(self):
+        return self.shot.width() / self.width()
+
+    def sel_rect(self):
+        if not self.start or not self.end:
+            return QRect()
+        return QRect(self.start, self.end).normalized()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.drawPixmap(self.rect(), self.shot)
+        dim = QColor(0, 0, 0, 110)
+        if self.mode == "freeform" and len(self.points) > 1:
+            path = QPainterPath()
+            path.addPolygon(QPolygonF([QPointF(x) for x in self.points]))
+            full = QPainterPath()
+            full.addRect(QRectF(self.rect()))
+            p.fillPath(full.subtracted(path), dim)
+            p.setPen(QPen(QColor("#ffffff"), 2))
+            p.drawPath(path)
+        elif self.start and self.end:
+            r = self.sel_rect()
+            full = QPainterPath()
+            full.addRect(QRectF(self.rect()))
+            hole = QPainterPath()
+            hole.addRect(QRectF(r))
+            p.fillPath(full.subtracted(hole), dim)
+            p.setPen(QPen(QColor("#ffffff"), 2))
+            p.drawRect(r)
+        else:
+            p.fillRect(self.rect(), dim)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.start = self.end = e.position().toPoint()
+            self.points = [self.start]
+
+    def mouseMoveEvent(self, e):
+        if self.start:
+            self.end = e.position().toPoint()
+            if self.mode == "freeform":
+                self.points.append(self.end)
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.LeftButton or not self.start:
+            return
+        k = self.ratio()
+        if self.mode == "freeform" and len(self.points) > 2:
+            poly = QPolygonF([QPointF(pt.x() * k, pt.y() * k) for pt in self.points])
+            bounds = poly.boundingRect().toRect().intersected(self.shot.rect())
+            out = QPixmap(bounds.size())
+            out.fill(Qt.transparent)
+            path = QPainterPath()
+            path.addPolygon(poly.translated(-bounds.x(), -bounds.y()))
+            p = QPainter(out)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setClipPath(path)
+            p.drawPixmap(0, 0, self.shot, bounds.x(), bounds.y(), bounds.width(), bounds.height())
+            p.end()
+            self.finish(out)
+        else:
+            r = self.sel_rect()
+            if r.width() < 3 or r.height() < 3:
+                self.finish(None)
+                return
+            if self.video:
+                g = r.translated(self.geometry().topLeft())
+                self.hide()
+                self.region.emit(g)
+                self.close()
+                return
+            src = QRect(round(r.x() * k), round(r.y() * k), round(r.width() * k), round(r.height() * k))
+            self.finish(self.shot.copy(src))
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self.finish(None)
+
+    def finish(self, pm):
+        self.hide()
+        self.done.emit(pm)
+        self.close()
+
+
+# ----------------------------------------------------------------- canvas
+class TextEdit(QLineEdit):
+    """Inline text box. Enter / click away = place text, Esc = cancel."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.cancelled = False
+        self.callout = None
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self.cancelled = True
+            self.clearFocus()
+        else:
+            super().keyPressEvent(e)
+
+
+def cloud_path(r, target):
+    """Scalloped 'revision cloud' outline around rectangle r."""
+    pts = [r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()]
+    path = QPainterPath()
+    path.moveTo(pts[0])
+    for i in range(4):
+        a, b = pts[i], pts[(i + 1) % 4]
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        length = math.hypot(dx, dy)
+        if length < 1:
+            continue
+        n = max(1, round(length / target))
+        seg = length / n
+        ux, uy = dx / length, dy / length
+        nx, ny = uy, -ux  # outward normal (clockwise path, y down)
+        h = seg * 0.5 * 4 / 3  # bezier handle that gives a ~semicircle bump
+        for k in range(n):
+            p0 = QPointF(a.x() + ux * seg * k, a.y() + uy * seg * k)
+            p1 = QPointF(a.x() + ux * seg * (k + 1), a.y() + uy * seg * (k + 1))
+            path.cubicTo(QPointF(p0.x() + nx * h, p0.y() + ny * h),
+                         QPointF(p1.x() + nx * h, p1.y() + ny * h), p1)
+    path.closeSubpath()
+    return path
+
+
+SHAPE_TOOLS = ("rect", "ellipse", "line", "arrow", "cloud")
+
+
+class Canvas(QWidget):
+    changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.pix = QPixmap()
+        self.base = QPixmap()
+        self.undo_stack, self.redo_stack = [], []
+        self.tool = "pen"
+        self.color = QColor("#e81123")
+        self.width = 4
+        self.a = self.b = None
+        self.path = None
+        self.editor = None
+        self.pending = None          # (box, tip) of a callout while its text is typed
+        self.co_stage, self.co_box, self.co_tip = 0, None, None  # callout drawing state
+        self.setMouseTracking(True)
+
+    def has_image(self):
+        return not self.pix.isNull()
+
+    def _scale(self):
+        """Bigger screenshots (4K / HiDPI) get proportionally bigger text and line heads."""
+        return max(1.0, self.pix.width() / 1200)
+
+    def set_tool(self, tool):
+        self.commit_pending()  # commit/discard unfinished text before switching
+        self.co_stage, self.co_box, self.co_tip = 0, None, None
+        self.a = self.b = None
+        self.tool = tool
+        self.update()
+
+    # --- text tool
+    def _font_px(self):
+        return int((16 + self.width * 3) * self._scale())
+
+    def _font(self, px=None):
+        f = QFont("Segoe UI")
+        f.setPixelSize(px or self._font_px())
+        f.setBold(True)
+        return f
+
+    def start_text(self, pt, box=None, tip=None):
+        self.commit_pending()  # an empty previous box simply disappears
+        ed = TextEdit(self)
+        ed.callout = (box, tip) if box is not None else None
+        ed.setTextMargins(0, 0, 0, 0)
+        if box is None:
+            font = self._font()
+            ed.setFont(font)
+            ed.setStyleSheet(
+                f"QLineEdit {{ background: transparent; color: {self.color.name()};"
+                f" border: 1px dashed #2a76c6; padding: 0px; margin: 0px; }}")
+            h = QFontMetrics(font).height() + 6
+            ed.setGeometry(int(pt.x()), int(pt.y() - h / 2), 160, h)
+            ed.textChanged.connect(lambda t, e=ed: e.setFixedWidth(
+                max(160, QFontMetrics(e.font()).horizontalAdvance(t) + 24)))
+        else:
+            px = max(10, min(self._font_px(), int(box.height() * 0.62)))
+            ed.setFont(self._font(px))
+            ed.setStyleSheet(
+                f"QLineEdit {{ background: transparent; color: {self.color.name()};"
+                f" border: none; padding: 0px; margin: 0px; }}")
+            ed.setGeometry(box.adjusted(8, 2, -8, -2).toRect())
+        ed.editingFinished.connect(lambda e=ed: self._commit(e))
+        self.editor = ed
+        ed.show()
+        ed.setFocus()
+        self.update()
+
+    def commit_pending(self):
+        if self.editor is not None:
+            self._commit(self.editor)
+
+    def _commit(self, ed):
+        if ed is not self.editor:  # stale signal from an old box
+            return
+        self.editor = None
+        text = ed.text().strip()
+        cancelled, co, font = ed.cancelled, ed.callout, ed.font()
+        geo = ed.geometry()
+        ed.hide()
+        ed.deleteLater()
+        self.pending = None
+        if cancelled or (co is None and not text):
+            self.update()
+            return
+        self._push()
+        p = QPainter(self.pix)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        if co is not None:
+            self._draw_callout(p, co[0], co[1])
+        if text:
+            p.setFont(font)
+            p.setPen(self.color)
+            if co is not None:
+                p.drawText(QRectF(geo), Qt.AlignLeft | Qt.AlignVCenter, text)
+            else:
+                p.drawText(QRect(geo.x() + 2, geo.y(), geo.width() + 400, geo.height()),
+                           Qt.AlignLeft | Qt.AlignVCenter, text)
+        p.end()
+        self.update()
+
+    def set_image(self, pm):
+        if self.editor is not None:
+            self.editor.hide()
+            self.editor.deleteLater()
+            self.editor = None
+        self.pending = None
+        self.co_stage, self.co_box, self.co_tip = 0, None, None
+        self.pix, self.base = pm.copy(), pm.copy()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.setFixedSize(pm.size())
+        self.update()
+        self.changed.emit()
+
+    # --- undo / redo
+    def _push(self):
+        self.undo_stack.append((self.pix.copy(), self.base.copy()))
+        self.redo_stack.clear()
+        self.changed.emit()
+
+    def undo(self):
+        self.commit_pending()
+        if self.undo_stack:
+            self.redo_stack.append((self.pix.copy(), self.base.copy()))
+            self.pix, self.base = self.undo_stack.pop()
+            self.setFixedSize(self.pix.size())
+            self.update()
+            self.changed.emit()
+
+    def redo(self):
+        if self.redo_stack:
+            self.undo_stack.append((self.pix.copy(), self.base.copy()))
+            self.pix, self.base = self.redo_stack.pop()
+            self.setFixedSize(self.pix.size())
+            self.update()
+            self.changed.emit()
+
+    # --- drawing helpers
+    def _pen(self):
+        if self.tool == "highlighter":
+            c = QColor(255, 235, 0, 110)
+            return QPen(c, self.width * 3 + 6, Qt.SolidLine, Qt.FlatCap, Qt.RoundJoin)
+        return QPen(self.color, self.width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+
+    def _draw_shape(self, p, a, b):
+        p.setPen(self._pen())
+        p.setBrush(Qt.NoBrush)
+        if self.tool == "rect":
+            p.drawRect(QRectF(a, b).normalized())
+        elif self.tool == "ellipse":
+            p.drawEllipse(QRectF(a, b).normalized())
+        elif self.tool == "cloud":
+            r = QRectF(a, b).normalized()
+            if r.width() > 6 and r.height() > 6:
+                p.drawPath(cloud_path(r, (18 + self.width * 2) * self._scale()))
+        elif self.tool == "line":
+            p.drawLine(a, b)
+        elif self.tool == "arrow":
+            p.drawLine(a, b)
+            ang = math.atan2(b.y() - a.y(), b.x() - a.x())
+            size = 10 + self.width * 2
+            pts = [b]
+            for d in (-0.5, 0.5):
+                pts.append(QPointF(b.x() - math.cos(ang + d) * size, b.y() - math.sin(ang + d) * size))
+            p.setBrush(self.color)
+            p.drawPolygon(QPolygonF(pts))
+
+    def _draw_callout(self, p, box, tip):
+        """Outlined text box + leader line (with a bend) ending in an open arrowhead."""
+        sc = self._scale()
+        k = 16 * sc
+        p.setPen(self._pen())
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(box)
+        cx, cy = box.center().x(), box.center().y()
+        if tip.y() > box.bottom():
+            s = QPointF(cx, box.bottom())
+            knee = QPointF(s.x(), s.y() + k)
+        elif tip.y() < box.top():
+            s = QPointF(cx, box.top())
+            knee = QPointF(s.x(), s.y() - k)
+        elif tip.x() < box.left():
+            s = QPointF(box.left(), cy)
+            knee = QPointF(s.x() - k, s.y())
+        else:
+            s = QPointF(box.right(), cy)
+            knee = QPointF(s.x() + k, s.y())
+        p.drawPolyline(QPolygonF([s, knee, tip]))
+        ang = math.atan2(tip.y() - knee.y(), tip.x() - knee.x())
+        head = (12 + self.width * 2.5) * sc
+        for d in (-0.45, 0.45):
+            p.drawLine(tip, QPointF(tip.x() - math.cos(ang + d) * head, tip.y() - math.sin(ang + d) * head))
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        if self.pix.isNull():
+            return
+        p.drawPixmap(0, 0, self.pix)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self.a and self.b:
+            if self.tool in SHAPE_TOOLS:
+                self._draw_shape(p, self.a, self.b)
+            elif self.tool == "crop":
+                p.setPen(QPen(Qt.white, 1, Qt.DashLine))
+                p.setBrush(QColor(0, 120, 215, 50))
+                p.drawRect(QRectF(self.a, self.b).normalized())
+            elif self.tool == "callout" and self.co_stage == 1:
+                p.setPen(QPen(self.color, 1, Qt.DashLine))
+                p.setBrush(QColor(0, 120, 215, 30))
+                p.drawRect(QRectF(self.a, self.b).normalized())
+        if self.tool == "callout" and self.co_stage == 2 and self.co_box and self.co_tip:
+            self._draw_callout(p, self.co_box, self.co_tip)
+        if self.pending:
+            self._draw_callout(p, *self.pending)
+        if self.path and self.tool in ("pen", "highlighter"):
+            p.setPen(self._pen())
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(self.path)
+
+    def mousePressEvent(self, e):
+        if not self.has_image() or e.button() != Qt.LeftButton:
+            return
+        pt = e.position()
+        self.commit_pending()  # clicking elsewhere finishes (or removes, if empty) the open text box
+        if self.tool == "text":
+            self.start_text(pt)
+            return
+        if self.tool == "callout":
+            if self.co_stage == 2:  # second click = where the arrow points
+                box = self.co_box
+                self.co_stage, self.co_box = 0, None
+                self.pending = (box, pt)
+                self.start_text(None, box, pt)
+                return
+            self.co_stage = 1
+        self.a = self.b = pt
+        if self.tool in ("pen", "highlighter"):
+            self.path = QPainterPath(pt)
+            self.path.lineTo(pt + QPointF(0.01, 0))
+        elif self.tool == "eraser":
+            self._push()
+            self._erase(pt)
+        self.update()
+
+    def mouseMoveEvent(self, e):
+        pt = e.position()
+        if self.tool == "callout" and self.co_stage == 2:
+            self.co_tip = pt
+            self.update()
+            return
+        if not self.a:
+            return
+        self.b = pt
+        if self.tool in ("pen", "highlighter") and self.path:
+            self.path.lineTo(pt)
+        elif self.tool == "eraser":
+            self._erase(pt)
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            return
+        if self.tool == "callout":
+            if self.co_stage == 1 and self.a and self.b:
+                box = QRectF(self.a, self.b).normalized()
+                if box.width() > 12 and box.height() > 8:
+                    self.co_box, self.co_stage, self.co_tip = box, 2, e.position()
+                else:
+                    self.co_stage = 0
+            self.a = self.b = None
+            self.update()
+            return
+        if not self.a:
+            return
+        if self.tool in ("pen", "highlighter") and self.path:
+            self._push()
+            p = QPainter(self.pix)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setPen(self._pen())
+            p.drawPath(self.path)
+            p.end()
+        elif self.tool in SHAPE_TOOLS:
+            if (self.b - self.a).manhattanLength() > 2:
+                self._push()
+                p = QPainter(self.pix)
+                p.setRenderHint(QPainter.Antialiasing)
+                self._draw_shape(p, self.a, self.b)
+                p.end()
+        elif self.tool == "crop":
+            r = QRectF(self.a, self.b).normalized().toRect().intersected(self.pix.rect())
+            if r.width() > 5 and r.height() > 5:
+                self._push()
+                self.pix, self.base = self.pix.copy(r), self.base.copy(r)
+                self.setFixedSize(self.pix.size())
+        self.a = self.b = self.path = None
+        self.update()
+
+    def _erase(self, pt):
+        """Erase = paint the original screenshot back over annotations."""
+        p = QPainter(self.pix)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(self.base)
+        r = 8 + self.width * 2
+        p.drawEllipse(pt, r, r)
+        p.end()
+
+
+# ------------------------------------------------------------------ icons
+ACCENT = {"text": "#0f6cbd", "rec": "#d13438", "pen": "#d13438", "highlighter": "#f2b800", "new": "#0f6cbd", "save": "#0f6cbd"}
+
+
+def make_icon(name):
+    """Draw a crisp vector icon (24x24 grid) so no image files are needed."""
+
+    def render(col, acc, name):
+        S = 96
+        pm = QPixmap(S, S)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.scale(S / 24, S / 24)
+        if name == "redo":
+            p.translate(24, 0)
+            p.scale(-1, 1)
+            name = "undo"
+        pen = QPen(QColor(col), 1.7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+
+        def L(x1, y1, x2, y2):
+            p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+        def poly(*pts):
+            path = QPainterPath(QPointF(*pts[0]))
+            for pt in pts[1:]:
+                path.lineTo(QPointF(*pt))
+            path.closeSubpath()
+            p.drawPath(path)
+
+        def dashed():
+            d = QPen(pen)
+            d.setStyle(Qt.CustomDashLine)
+            d.setDashPattern([1.5, 1.3])
+            d.setCapStyle(Qt.FlatCap)
+            p.setPen(d)
+
+        if name == "new":
+            p.setPen(QPen(QColor(acc), 2.2, Qt.SolidLine, Qt.RoundCap))
+            L(12, 4.5, 12, 19.5)
+            L(4.5, 12, 19.5, 12)
+        elif name == "m_rect":
+            dashed()
+            p.drawRoundedRect(QRectF(3.5, 5, 17, 14), 1.5, 1.5)
+        elif name == "m_free":
+            dashed()
+            path = QPainterPath(QPointF(4.5, 15.5))
+            path.cubicTo(2.5, 7, 11, 3.5, 16, 6)
+            path.cubicTo(22, 9, 18, 18, 12.5, 16.5)
+            path.cubicTo(9.5, 15.5, 8, 18.5, 4.5, 15.5)
+            p.drawPath(path)
+        elif name == "m_full":
+            p.drawRoundedRect(QRectF(3, 4.5, 18, 12), 1.5, 1.5)
+            L(8, 20, 16, 20)
+            L(12, 16.5, 12, 20)
+        elif name == "clock":
+            p.drawEllipse(QPointF(12, 12), 8.5, 8.5)
+            L(12, 7, 12, 12)
+            L(12, 12, 15.5, 14)
+        elif name == "undo":
+            L(4.5, 12, 9.5, 7)
+            L(4.5, 12, 9.5, 17)
+            path = QPainterPath(QPointF(5, 12))
+            path.cubicTo(10, 6.5, 19.5, 7, 20, 17.5)
+            p.drawPath(path)
+        elif name == "save":
+            p.drawRoundedRect(QRectF(4, 4, 16, 16), 2, 2)
+            p.drawRect(QRectF(8, 4, 8, 5))
+            p.setPen(QPen(QColor(acc), 1.7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.drawRect(QRectF(7.5, 13, 9, 7))
+        elif name == "copy":
+            p.drawRoundedRect(QRectF(9, 9, 11, 11), 2, 2)
+            path = QPainterPath(QPointF(5, 15))
+            path.lineTo(5, 6.5)
+            path.quadTo(5, 5, 6.5, 5)
+            path.lineTo(14.5, 5)
+            p.drawPath(path)
+        elif name == "cam":
+            p.drawRoundedRect(QRectF(3, 7, 18, 12), 2, 2)
+            path = QPainterPath(QPointF(8, 7))
+            path.lineTo(9.5, 4.5)
+            path.lineTo(14.5, 4.5)
+            path.lineTo(16, 7)
+            p.drawPath(path)
+            p.drawEllipse(QPointF(12, 13), 3.4, 3.4)
+        elif name == "video":
+            p.drawRoundedRect(QRectF(3, 6.5, 13, 11), 2, 2)
+            poly((16, 11), (21, 8), (21, 16), (16, 13))
+        elif name == "rec":
+            p.setPen(QPen(QColor(acc), 1.7))
+            p.setBrush(QColor(acc))
+            p.drawEllipse(QPointF(12, 12), 6.5, 6.5)
+        elif name == "stop":
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(col))
+            p.drawRoundedRect(QRectF(6, 6, 12, 12), 2, 2)
+        elif name == "pause":
+            p.setPen(QPen(QColor(col), 3, Qt.SolidLine, Qt.RoundCap))
+            L(9, 6.5, 9, 17.5)
+            L(15, 6.5, 15, 17.5)
+        elif name == "close":
+            L(6, 6, 18, 18)
+            L(18, 6, 6, 18)
+        elif name == "more":
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(col))
+            for x in (5, 12, 19):
+                p.drawEllipse(QPointF(x, 12), 1.8, 1.8)
+        elif name == "pen":
+            poly((4, 20), (5.2, 15.2), (16, 4.5), (19.5, 8), (8.8, 18.8))
+            L(13.5, 7, 17, 10.5)
+            p.setBrush(QColor(acc))
+            poly((4, 20), (5.2, 15.2), (8.8, 18.8))
+        elif name == "highlighter":
+            poly((8.5, 13.5), (15, 7), (19.5, 11.5), (13, 18))
+            poly((8.5, 13.5), (13, 18), (9, 19), (6.5, 16.5))
+            p.setPen(QPen(QColor(acc), 3, Qt.SolidLine, Qt.FlatCap))
+            L(4, 21.5, 15, 21.5)
+        elif name == "eraser":
+            poly((3.5, 14.5), (12.5, 5.5), (19.5, 12.5), (12, 20), (8, 20))
+            L(8, 10, 15, 17)
+            L(12, 20, 21, 20)
+        elif name == "t_rect":
+            p.drawRoundedRect(QRectF(4, 6, 16, 12), 1.5, 1.5)
+        elif name == "t_ellipse":
+            p.drawEllipse(QRectF(4, 5, 16, 14))
+        elif name == "t_line":
+            L(5, 19, 19, 5)
+        elif name == "t_arrow":
+            L(5, 19, 18, 6)
+            L(10, 6, 18, 6)
+            L(18, 6, 18, 14)
+        elif name == "text":
+            p.setPen(QPen(QColor(acc), 3.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            L(5, 5.5, 19, 5.5)
+            L(12, 5.5, 12, 19.5)
+            L(8.5, 19.5, 15.5, 19.5)
+        elif name == "callout":
+            p.drawRect(QRectF(3.5, 3.5, 13, 8))
+            path = QPainterPath(QPointF(10, 11.5))
+            path.lineTo(10, 15.5)
+            path.lineTo(19.5, 20.5)
+            p.drawPath(path)
+            ang = math.atan2(5, 9.5)
+            for d in (-0.5, 0.5):
+                L(19.5, 20.5, 19.5 - math.cos(ang + d) * 4.5, 20.5 - math.sin(ang + d) * 4.5)
+        elif name == "t_cloud":
+            p.drawPath(cloud_path(QRectF(3.5, 6.5, 17, 11), 4.4))
+        elif name == "crop":
+            path = QPainterPath(QPointF(7, 3))
+            path.lineTo(7, 17)
+            path.lineTo(21, 17)
+            p.drawPath(path)
+            path = QPainterPath(QPointF(3, 7))
+            path.lineTo(17, 7)
+            path.lineTo(17, 21)
+            p.drawPath(path)
+        p.end()
+        return pm
+
+    ic = QIcon()
+    dark = "#2b2b2b"
+    ic.addPixmap(render(dark, ACCENT.get(name, dark), name), QIcon.Normal)
+    ic.addPixmap(render("#b8b8b8", "#b8b8b8", name), QIcon.Disabled)
+    return ic
+
+
+MODE_ICON = {"rect": "m_rect", "freeform": "m_free", "full": "m_full"}
+
+
+# -------------------------------------------------------------- recording
+VIDEO_DIR = Path.home() / "Videos" / "SNP Editor"
+
+
+def exclude_from_capture(w):
+    """Hide a window from screen capture (Windows 10 2004+), so the record bar never shows in videos."""
+    try:
+        import ctypes
+        ctypes.windll.user32.SetWindowDisplayAffinity(int(w.winId()), 0x11)
+    except Exception:
+        pass
+
+
+class FfmpegWriter:
+    """Pipes raw BGR frames into ffmpeg -> H.264 MP4 (plays in chat apps and browsers)."""
+
+    def __init__(self, path, size, fps):
+        w, h = size
+        cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
+               "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", str(fps), "-i", "-",
+               "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+               "-pix_fmt", "yuv420p", "-movflags", "+faststart", path]
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, creationflags=0x08000000)
+
+    def isOpened(self):
+        return self.p.poll() is None
+
+    def write(self, frame):
+        try:
+            self.p.stdin.write(frame.tobytes())
+        except (BrokenPipeError, OSError):
+            pass
+
+    def release(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(timeout=30)
+        except Exception:
+            self.p.kill()
+
+
+class Recorder(QObject):
+    tick = Signal(float)
+    failed = Signal(str)
+
+    def __init__(self, region, path, fps=15):
+        super().__init__()
+        self.path, self.fps = path, fps
+        self.screen = QGuiApplication.screenAt(region.center()) or QGuiApplication.primaryScreen()
+        sg = self.screen.geometry()
+        self.local = region.intersected(sg).translated(-sg.topLeft())
+        self.writer, self.size, self.frames = None, None, 0
+        self.t0, self.paused, self.pause_t = 0.0, 0.0, None
+        self.timer = QTimer(self)
+        self.timer.setInterval(int(1000 / fps))
+        self.timer.timeout.connect(self._grab)
+
+    def start(self):
+        self.t0 = time.perf_counter()
+        self.timer.start()
+        self._grab()
+
+    def elapsed(self):
+        now = self.pause_t if self.pause_t is not None else time.perf_counter()
+        return now - self.t0 - self.paused
+
+    def pause(self):
+        self.timer.stop()
+        self.pause_t = time.perf_counter()
+
+    def resume(self):
+        if self.pause_t is not None:
+            self.paused += time.perf_counter() - self.pause_t
+            self.pause_t = None
+        self.timer.start()
+
+    def _grab(self):
+        r = self.local
+        pm = self.screen.grabWindow(0, r.x(), r.y(), r.width(), r.height())
+        if pm.isNull():
+            return
+        img = pm.toImage().convertToFormat(QImage.Format_RGB32)  # memory order: B G R X
+        w, h = img.width(), img.height()
+        arr = np.frombuffer(img.constBits(), np.uint8).reshape(h, img.bytesPerLine() // 4, 4)[:, :w, :3]
+        frame = np.ascontiguousarray(arr)
+        if self.writer is None:
+            s = min(1.0, 1920 / w, 1080 / h)
+            self.size = (max(2, int(w * s) // 2 * 2), max(2, int(h * s) // 2 * 2))
+            if HAVE_FFMPEG:
+                try:
+                    self.writer = FfmpegWriter(self.path, self.size, self.fps)
+                except Exception:
+                    self.writer = None
+            if self.writer is None:  # fallback encoder
+                self.writer = cv2.VideoWriter(self.path, cv2.VideoWriter_fourcc(*"mp4v"), self.fps, self.size)
+            if not self.writer.isOpened():
+                self.timer.stop()
+                self.failed.emit("Could not start the video encoder.")
+                return
+        if (w, h) != self.size:
+            frame = cv2.resize(frame, self.size, interpolation=cv2.INTER_AREA)
+        t = self.elapsed()
+        n = min(int(t * self.fps) + 1 - self.frames, self.fps * 2)  # keep real-time speed
+        for _ in range(max(n, 0)):
+            self.writer.write(frame)
+            self.frames += 1
+        self.tick.emit(t)
+
+    def stop(self):
+        self.timer.stop()
+        if self.writer is not None:
+            self.writer.release()
+        return self.path, self.frames / self.fps
+
+
+class RegionFrame(QWidget):
+    """Red border drawn just outside the recorded area."""
+
+    def __init__(self, rect):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+                         | Qt.WindowTransparentForInput)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setGeometry(rect.adjusted(-3, -3, 3, 3))
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setPen(QPen(QColor("#e81123"), 3))
+        p.drawRect(QRectF(1.5, 1.5, self.width() - 3, self.height() - 3))
+
+
+class RecorderBar(QWidget):
+    started = Signal()
+    stop_req = Signal()
+    pause_req = Signal(bool)
+    cancel_req = Signal()
+
+    def __init__(self):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setObjectName("bar")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "QWidget#bar { background: #ffffff; border: 1px solid #9a9a9a; border-radius: 8px; }"
+            "QLabel { font-size: 15px; font-weight: 600; color: #222; background: transparent; }")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(6)
+        self.btn_start = self._tb("rec", "Start", self._countdown)
+        self.btn_pause = self._tb("pause", "", lambda: None)
+        self.btn_pause.setCheckable(True)
+        self.btn_pause.setToolTip("Pause / resume")
+        self.btn_pause.toggled.connect(self.pause_req)
+        self.btn_stop = self._tb("stop", "Stop", self.stop_req.emit)
+        self.lbl = QLabel("Ready")
+        self.lbl.setMinimumWidth(70)
+        self.lbl.setAlignment(Qt.AlignCenter)
+        self.btn_cancel = self._tb("close", "", self.cancel_req.emit)
+        self.btn_cancel.setToolTip("Cancel (Esc)")
+        for w in (self.btn_start, self.btn_pause, self.btn_stop, self.lbl, self.btn_cancel):
+            lay.addWidget(w)
+        self.btn_pause.hide()
+        self.btn_stop.hide()
+        self.count = 0
+        self._cd = QTimer(self)
+        self._cd.timeout.connect(self._cd_tick)
+
+    def _tb(self, icon, text, fn):
+        b = QToolButton()
+        b.setIcon(make_icon(icon))
+        b.setIconSize(QSize(22, 22))
+        b.setMinimumHeight(38)
+        if text:
+            b.setText(text)
+            b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        else:
+            b.setFixedSize(40, 38)
+        b.clicked.connect(lambda _=False: fn())
+        return b
+
+    def _countdown(self):
+        self.btn_start.hide()
+        self.count = 3
+        self.lbl.setText("Starting in 3")
+        self._cd.start(1000)
+        self.adjustSize()
+
+    def _cd_tick(self):
+        self.count -= 1
+        if self.count <= 0:
+            self._cd.stop()
+            self.btn_pause.show()
+            self.btn_stop.show()
+            self.lbl.setText("0:00")
+            self.adjustSize()
+            self.started.emit()
+        else:
+            self.lbl.setText(f"Starting in {self.count}")
+
+    def set_time(self, t):
+        m, s = divmod(int(t), 60)
+        self.lbl.setText(f"{m}:{s:02d}")
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self.cancel_req.emit()
+
+
+# ------------------------------------------------------------ main window
+class SnipWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SNP Editor")
+        self.resize(900, 600)
+        self.mode, self.delay = "rect", 0
+        self.capture, self.view = "photo", "none"
+        self.overlay = self.rec = self.bar = self.frame = None
+        self.video_path = ""
+
+        root = QWidget(objectName="root")
+        self.setCentralWidget(root)
+        v = QVBoxLayout(root)
+        v.setContentsMargins(8, 6, 8, 0)
+
+        # ---- row 1: New / mode / delay ... undo redo save copy
+        r1 = QHBoxLayout()
+        r1.setSpacing(4)
+        self.btn_new = self._btn("new", self.new_snip, "Ctrl+N", "New", "New snip")
+        r1.addWidget(self.btn_new)
+
+        self.cap_group = QButtonGroup(self)
+        self.cap_group.setExclusive(True)
+        for kind, icon, tip in (("photo", "cam", "Screenshot"), ("video", "video", "Screen recording")):
+            cb = QToolButton()
+            cb.setIcon(make_icon(icon))
+            cb.setIconSize(QSize(24, 24))
+            cb.setFixedSize(46, 42)
+            cb.setCheckable(True)
+            cb.setToolTip(tip)
+            cb.clicked.connect(lambda _=False, k=kind: self._set_capture(k))
+            self.cap_group.addButton(cb)
+            r1.addWidget(cb)
+            if kind == "photo":
+                cb.setChecked(True)
+
+        self.btn_mode = QToolButton()
+        self.btn_mode.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_mode.setPopupMode(QToolButton.InstantPopup)
+        self.btn_mode.setToolTip("Snipping mode")
+        m = QMenu(self)
+        for label, key in (("Rectangle", "rect"), ("Freeform", "freeform"), ("Full screen", "full")):
+            act = m.addAction(label)
+            act.setIcon(make_icon(MODE_ICON[key]))
+            act.triggered.connect(lambda _=False, k=key, l=label: self._set_mode(k, l))
+        self.btn_mode.setMenu(m)
+        r1.addWidget(self.btn_mode)
+
+        self.btn_delay = QToolButton()
+        self.btn_delay.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_delay.setPopupMode(QToolButton.InstantPopup)
+        self.btn_delay.setToolTip("Delay")
+        self.btn_delay.setIcon(make_icon("clock"))
+        dm = QMenu(self)
+        for s in (0, 3, 5, 10):
+            act = dm.addAction("No delay" if s == 0 else f"{s} seconds")
+            act.triggered.connect(lambda _=False, s=s: self._set_delay(s))
+        self.btn_delay.setMenu(dm)
+        r1.addWidget(self.btn_delay)
+        r1.addStretch()
+
+        self.btn_undo = self._btn("undo", lambda: self.canvas.undo(), "Ctrl+Z", tip="Undo")
+        self.btn_redo = self._btn("redo", lambda: self.canvas.redo(), "Ctrl+Y", tip="Redo")
+        self.btn_save = self._btn("save", self.save, "Ctrl+S", tip="Save")
+        self.btn_copy = self._btn("copy", self.copy, "Ctrl+C", tip="Copy")
+        self.btn_more = QToolButton()
+        self.btn_more.setIcon(make_icon("more"))
+        self.btn_more.setIconSize(QSize(24, 24))
+        self.btn_more.setToolTip("See more")
+        self.btn_more.setPopupMode(QToolButton.InstantPopup)
+        self.btn_more.setStyleSheet("QToolButton::menu-indicator { image: none; }")
+        mm = QMenu(self)
+        mm.addAction("About", lambda: QMessageBox.about(self, "About", "SNP Editor\nBuilt with PySide6"))
+        mm.addAction("Exit", self.close)
+        self.btn_more.setMenu(mm)
+        for b in (self.btn_undo, self.btn_redo, self.btn_save, self.btn_copy, self.btn_more):
+            r1.addWidget(b)
+        v.addLayout(r1)
+
+        # ---- row 2: drawing tools
+        r2 = QHBoxLayout()
+        r2.setSpacing(4)
+        r2.addStretch()
+        self.canvas = Canvas()
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        tools = [("pen", "pen", "Ballpoint pen"), ("highlighter", "highlighter", "Highlighter"),
+                 ("eraser", "eraser", "Eraser"), ("t_rect", "rect", "Rectangle"),
+                 ("t_ellipse", "ellipse", "Ellipse"), ("t_line", "line", "Line"),
+                 ("t_arrow", "arrow", "Arrow"), ("callout", "callout", "Callout"),
+                 ("t_cloud", "cloud", "Cloud"), ("text", "text", "Text"), ("crop", "crop", "Crop")]
+        for icon, key, tip in tools:
+            b = QToolButton()
+            b.setIcon(make_icon(icon))
+            b.setIconSize(QSize(26, 26))
+            b.setFixedSize(46, 42)
+            b.setToolTip(tip)
+            b.setCheckable(True)
+            b.clicked.connect(lambda _=False, k=key: self.canvas.set_tool(k))
+            self.group.addButton(b)
+            r2.addWidget(b)
+            if key == "pen":
+                b.setChecked(True)
+        sep = QFrame(objectName="sep")
+        sep.setFixedSize(1, 28)
+        r2.addWidget(sep)
+        self.btn_color = QToolButton()
+        self.btn_color.setText("Outline")
+        self.btn_color.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn_color.setIconSize(QSize(22, 22))
+        self.btn_color.setMinimumHeight(42)
+        self.btn_color.clicked.connect(self.pick_color)
+        self._paint_color_btn()
+        r2.addWidget(self.btn_color)
+        self.size_box = QComboBox()
+        self.size_box.setMinimumHeight(34)
+        for s in (2, 4, 6, 10, 16):
+            self.size_box.addItem(f"{s} px", s)
+        self.size_box.setCurrentIndex(1)
+        self.size_box.currentIndexChanged.connect(lambda: setattr(self.canvas, "width", self.size_box.currentData()))
+        r2.addWidget(self.size_box)
+        r2.addStretch()
+        r2.setContentsMargins(0, 0, 0, 0)
+        self.tools_bar = QWidget()
+        self.tools_bar.setLayout(r2)
+        v.addWidget(self.tools_bar)
+
+        self._set_mode("rect", "Rectangle")
+        self._set_delay(0)
+
+        # ---- canvas area
+        self.scroll = QScrollArea()
+        self.scroll.setAlignment(Qt.AlignCenter)
+        self.scroll.setWidget(self.canvas)
+        self.hint = QLabel("Press  New  (Ctrl+N)  to take a snip")
+        self.hint.setAlignment(Qt.AlignCenter)
+        self.hint.setStyleSheet("color:#777; font-size:14px; background:white;")
+        v.addWidget(self.hint, 1)
+        v.addWidget(self.scroll, 1)
+        self.vpanel = QWidget(objectName="vpanel")
+        self.vpanel.setStyleSheet("QWidget#vpanel { background: white; }")
+        vp = QVBoxLayout(self.vpanel)
+        vp.addStretch()
+        self.vinfo = QLabel()
+        self.vinfo.setAlignment(Qt.AlignCenter)
+        self.vinfo.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        vp.addWidget(self.vinfo)
+        vb = QHBoxLayout()
+        vb.addStretch()
+        for text, fn in (("▶  Play", self.play_video), ("Show in folder", self.show_in_folder),
+                         ("Save as…", self.save), ("Delete", self.delete_video)):
+            pb = QPushButton(text)
+            pb.setMinimumHeight(36)
+            pb.setMinimumWidth(110)
+            pb.clicked.connect(lambda _=False, f=fn: f())
+            vb.addWidget(pb)
+        vb.addStretch()
+        vp.addLayout(vb)
+        vp.addStretch()
+        v.addWidget(self.vpanel, 1)
+        self.vpanel.hide()
+        self.scroll.hide()
+        self.canvas.changed.connect(self._refresh)
+        self._refresh()
+
+    def _btn(self, icon, fn, shortcut=None, text="", tip=""):
+        b = QToolButton()
+        b.setIcon(make_icon(icon))
+        b.setIconSize(QSize(24, 24))
+        b.setMinimumHeight(42)
+        if text:
+            b.setText(text)
+            b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        else:
+            b.setFixedSize(46, 42)
+        b.setToolTip(f"{tip or text}  ({shortcut})" if shortcut else (tip or text))
+        b.clicked.connect(lambda _=False: fn())
+        if shortcut:
+            QShortcut(QKeySequence(shortcut), self, activated=fn)
+        return b
+
+    def _paint_color_btn(self):
+        pm = QPixmap(44, 44)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor("#888"), 2))
+        p.setBrush(self.canvas.color)
+        p.drawEllipse(3, 3, 38, 38)
+        p.end()
+        self.btn_color.setIcon(QIcon(pm))
+
+    def _refresh(self):
+        img = self.view == "image"
+        self.scroll.setVisible(img)
+        self.hint.setVisible(self.view == "none")
+        self.vpanel.setVisible(self.view == "video")
+        self.btn_undo.setEnabled(img and bool(self.canvas.undo_stack))
+        self.btn_redo.setEnabled(img and bool(self.canvas.redo_stack))
+        self.btn_save.setEnabled(self.view != "none")
+        self.btn_copy.setEnabled(img or self.view == "video")
+
+    def _set_mode(self, key, label):
+        self.mode = key
+        self.btn_mode.setText(label)
+        self.btn_mode.setIcon(make_icon(MODE_ICON[key]))
+        self.btn_mode.setIconSize(QSize(24, 24))
+
+    def _set_delay(self, s):
+        self.delay = s
+        self.btn_delay.setText("No delay" if s == 0 else f"{s} seconds")
+        self.btn_delay.setIconSize(QSize(24, 24))
+
+    def pick_color(self):
+        c = QColorDialog.getColor(self.canvas.color, self, "Outline color")
+        if c.isValid():
+            self.canvas.color = c
+            self._paint_color_btn()
+
+    # ---- capture flow
+    def _set_capture(self, kind):
+        self.capture = kind
+        photo = kind == "photo"
+        self.btn_mode.setVisible(photo)
+        self.btn_delay.setVisible(photo)
+        self.tools_bar.setVisible(photo)
+
+    def new_snip(self):
+        if self.rec_active():
+            return
+        if self.capture == "video" and not HAVE_CV:
+            QMessageBox.warning(self, "Recording unavailable",
+                                "OpenCV is missing, so screen recording can't be used.")
+            return
+        delay = self.delay if self.capture == "photo" else 0
+        self.hide()
+        QTimer.singleShot(delay * 1000 + 300, self._capture)
+
+    def _capture(self):
+        shot, vgeo = grab_all()
+        if self.capture == "video":
+            self.overlay = SnipOverlay(shot, vgeo, "rect", video=True)
+            self.overlay.region.connect(self._region_selected)
+            self.overlay.done.connect(self._on_done)  # emitted only on cancel
+            return
+        if self.mode == "full":
+            self._on_done(shot)
+            return
+        self.overlay = SnipOverlay(shot, vgeo, self.mode)
+        self.overlay.done.connect(self._on_done)
+
+    def _show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_done(self, pm):
+        self._show_window()
+        if pm is not None:
+            self.view = "image"
+            self.canvas.set_image(pm)
+            QGuiApplication.clipboard().setPixmap(pm)
+            self.resize(max(self.width(), min(pm.width() + 40, 1400)),
+                        max(self.height(), min(pm.height() + 160, 900)))
+        self._refresh()
+
+    # ---- video recording
+    def rec_active(self):
+        return self.bar is not None
+
+    def _region_selected(self, rect):
+        self.rec_rect = rect
+        self.frame = RegionFrame(rect)
+        self.bar = RecorderBar()
+        self.bar.started.connect(self._begin_recording)
+        self.bar.stop_req.connect(self._stop_recording)
+        self.bar.pause_req.connect(self._pause_recording)
+        self.bar.cancel_req.connect(self._cancel_recording)
+        self.frame.show()
+        self.bar.show()
+        screen = QGuiApplication.screenAt(rect.center()) or QGuiApplication.primaryScreen()
+        sg = screen.geometry()
+        self.bar.adjustSize()
+        bw, bh = self.bar.width(), self.bar.height()
+        x = min(max(rect.center().x() - bw // 2, sg.left() + 4), sg.right() - bw - 4)
+        if rect.bottom() + 12 + bh < sg.bottom():
+            y = rect.bottom() + 12
+        elif rect.top() - 12 - bh > sg.top():
+            y = rect.top() - 12 - bh
+        else:
+            y = rect.top() + 12
+        self.bar.move(x, y)
+        exclude_from_capture(self.frame)
+        exclude_from_capture(self.bar)
+        self.bar.activateWindow()
+        self.bar.setFocus()
+
+    def _begin_recording(self):
+        try:
+            VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+            folder = VIDEO_DIR
+        except OSError:
+            folder = Path(tempfile.gettempdir())
+        path = folder / f"Recording {datetime.now():%Y-%m-%d %H%M%S}.mp4"
+        self.rec = Recorder(self.rec_rect, str(path))
+        self.rec.tick.connect(self.bar.set_time)
+        self.rec.failed.connect(self._rec_failed)
+        self.rec.start()
+
+    def _pause_recording(self, paused):
+        if self.rec:
+            self.rec.pause() if paused else self.rec.resume()
+
+    def _close_rec_ui(self):
+        for w in (self.bar, self.frame):
+            if w is not None:
+                w.close()
+                w.deleteLater()
+        self.bar = self.frame = None
+
+    def _stop_recording(self):
+        if not self.rec:
+            return
+        path, dur = self.rec.stop()
+        self.rec = None
+        self._close_rec_ui()
+        self._show_window()
+        if dur < 0.3 or not os.path.exists(path):
+            QMessageBox.information(self, "Recording", "The recording was too short to save.")
+            return
+        self._show_video(path, dur)
+
+    def _cancel_recording(self):
+        if self.rec:
+            path, _ = self.rec.stop()
+            self.rec = None
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        if self.bar is not None:
+            self.bar._cd.stop()
+        self._close_rec_ui()
+        self._show_window()
+
+    def _rec_failed(self, msg):
+        self._cancel_recording()
+        QMessageBox.warning(self, "Recording failed", msg)
+
+    def _show_video(self, path, dur):
+        self.video_path = path
+        self.view = "video"
+        m, s = divmod(int(dur), 60)
+        mb = os.path.getsize(path) / 1048576
+        self.vinfo.setText(
+            "<div style='font-size:22px'><b>Recording saved</b></div>"
+            f"<div style='color:#555;font-size:15px'>{m}:{s:02d} &nbsp;•&nbsp; {mb:.1f} MB</div>"
+            f"<div style='color:#888;font-size:12px'>{path}</div>"
+            "<div style='color:#0f6cbd;font-size:14px;margin-top:10px'>Copied to clipboard - press Ctrl+V in your chat to send it</div>")
+        self._copy_video()
+        self._refresh()
+
+    def _copy_video(self):
+        """Put the video FILE on the clipboard (like copying it in Explorer)."""
+        md = QMimeData()
+        md.setUrls([QUrl.fromLocalFile(self.video_path)])
+        QGuiApplication.clipboard().setMimeData(md)
+
+    def play_video(self):
+        if hasattr(os, "startfile"):
+            os.startfile(self.video_path)
+
+    def show_in_folder(self):
+        subprocess.Popen(["explorer", "/select,", os.path.normpath(self.video_path)])
+
+    def delete_video(self):
+        try:
+            os.remove(self.video_path)
+        except OSError:
+            pass
+        self.view = "none"
+        self._refresh()
+
+    def save(self):
+        if self.view == "video":
+            name = os.path.basename(self.video_path)
+            path, _ = QFileDialog.getSaveFileName(self, "Save recording as", name, "MP4 video (*.mp4)")
+            if path:
+                shutil.copy(self.video_path, path)
+            return
+        if self.view != "image":
+            return
+        self.canvas.commit_pending()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save as", "Screenshot.png", "PNG (*.png);;JPEG (*.jpg);;Bitmap (*.bmp)")
+        if path:
+            self.canvas.pix.save(path)
+
+    def copy(self):
+        if self.view == "video":
+            self._copy_video()
+        elif self.canvas.has_image():
+            self.canvas.commit_pending()
+            QGuiApplication.clipboard().setPixmap(self.canvas.pix)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyleSheet(STYLE)
+    w = SnipWindow()
+    w.show()
+    sys.exit(app.exec())
